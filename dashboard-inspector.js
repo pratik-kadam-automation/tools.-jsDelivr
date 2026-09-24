@@ -10,6 +10,8 @@
   var paused = false, picking = false, timer = 0, total = 0, tab = 'live';
   var picked = null, watchObs = null, watchEl = null, watchLog = [], lastIn = null;
   var sockets = new Set(), cache = null, erudaReady = false;
+  var viewRaw = false, topicDefault = false, treeAll = false;
+  function isOpen(k, def) { return OPEN[k] === undefined ? def : OPEN[k]; }
 
   function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
@@ -51,6 +53,10 @@
     '.sec{padding:6px 0;border-bottom:1px solid #3d4c63}.acts{display:flex;flex-wrap:wrap;gap:4px;margin:5px 0}' +
     '.hl{position:fixed;pointer-events:none;border:2px solid #ff3dcb;background:rgba(255,61,203,.15);z-index:2147483646;display:none}' +
     'h4{margin:8px 0 3px;font-size:12px;color:#8a98ad;font-weight:600}' +
+    '.tree{font:11.5px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:4px 0}' +
+    '.tree details{border:0;padding:0 0 0 12px}.tree summary{padding:1px 0}' +
+    '.jl{padding:1px 0 1px 12px;word-break:break-all}.jk{color:#e6b673}.js{color:#9fd88f}.jnum{color:#5fd4e8}.jb{color:#ff9e64}.jn{color:#8a98ad}' +
+    '.ch{background:rgba(242,169,59,.18);border-left:2px solid #f2a93b}' +
     '</style>' +
     '<div class="hl"></div>' +
     '<div class="p">' +
@@ -89,8 +95,10 @@
 
   function sub(o) {
     if (!o || typeof o !== 'object') return '';
-    var v = o.id != null ? o.id : (o.topic != null ? o.topic : null);
-    return v != null && typeof v !== 'object' ? ':' + String(v).slice(0, 60) : '';
+    var v = o.id != null ? o.id : (o.topic != null ? o.topic : (o.event != null ? o.event : null));
+    var dv = o.deviceId != null ? o.deviceId : (o.device_id != null ? o.device_id : (o.gateway_id != null ? o.gateway_id : o.machineId));
+    return (v != null && typeof v !== 'object' ? ':' + String(v).slice(0, 60) : '') +
+      (dv != null && typeof dv !== 'object' && dv !== v ? ' @ ' + String(dv).slice(0, 60) : '');
   }
   function keyOf(j) {
     if (Array.isArray(j) && typeof j[0] === 'string') {
@@ -372,12 +380,16 @@
     else if (a === 'watch') startWatch();
     else if (a === 'unwatch') { if (watchObs) watchObs.disconnect(); watchObs = null; watchEl = null; render(); }
     else if (a === 'research') { cache = null; render(); }
+    else if (a === 'expall') { topicDefault = true; treeAll = true; OPEN = {}; render(); }
+    else if (a === 'colall') { topicDefault = false; treeAll = false; OPEN = {}; render(); }
+    else if (a === 'raw') { viewRaw = !viewRaw; render(); }
   }
 
   root.addEventListener('click', function (e) {
     var t = e.target;
     var sm = t.closest('summary');
-    if (sm) { OPEN[sm.parentNode.dataset.k] = !sm.parentNode.open; return; }
+    if (sm) { e.preventDefault(); OPEN[sm.parentNode.dataset.k] = !sm.parentNode.open; render(); return; }
+    var lf = t.closest('[data-leaf]'); if (lf) { copy(lf.dataset.leaf); return; }
     var b = t.closest('[data-a]'); if (b) { act(b.dataset.a); return; }
     var tb = t.closest('[data-t]'); if (tb) { tab = tb.dataset.t; render(); return; }
     var c = t.closest('[data-copy]'); if (c) { var h = L[c.dataset.copy]; if (h) copy(h.hist[0].s); return; }
@@ -385,23 +397,61 @@
   });
 
   /* ---------------- render ---------------- */
+  function leafHtml(v) {
+    if (v === null) return '<span class="jn">null</span>';
+    if (typeof v === 'string') return '<span class="js">"' + esc(short(v, 400)) + '"</span>';
+    if (typeof v === 'number') return '<span class="jnum">' + v + '</span>';
+    if (typeof v === 'boolean') return '<span class="jb">' + v + '</span>';
+    return esc(String(v));
+  }
+  function tree(v, prev, hasPrev, tk, pa, name, depth) {
+    var label = name === null ? '' : '<span class="jk">' + esc(name) + '</span>: ';
+    if (v !== null && typeof v === 'object') {
+      var isA = Array.isArray(v), ks = Object.keys(v), k = tk + ' ›' + pa.join('›');
+      var open = isOpen(k, treeAll || depth < 2);
+      var h = '<details data-k="' + esc(k) + '"' + (open ? ' open' : '') + '><summary>' + label +
+        '<span class="m">' + (isA ? '[' + ks.length + ']' : '{' + ks.length + '}') + '</span></summary>';
+      if (open) ks.forEach(function (c) {
+        h += tree(v[c], prev && typeof prev === 'object' ? prev[c] : undefined, hasPrev, tk, pa.concat(c), c, depth + 1);
+      });
+      return h + '</details>';
+    }
+    var ch = hasPrev && prev !== v;
+    return '<div class="jl' + (ch ? ' ch' : '') + '" data-leaf="' + esc(pstr(pa)) + '">' + label + leafHtml(v) +
+      (ch ? ' <span class="m">was ' + esc(short(prev, 40)) + '</span>' : '') + '</div>';
+  }
   function renderLive() {
-    var q = flt.value.trim().toLowerCase(), h = '';
+    var q = flt.value.trim().toLowerCase();
+    var h = '<div class="acts"><button data-a="expall">Expand all</button><button data-a="colall">Collapse all</button>' +
+      '<button data-a="raw">' + (viewRaw ? 'Tree view' : 'Raw JSON') + '</button></div>' +
+      '<div class="m">Highlighted = changed since the previous message. Tap a value to copy its path.</div>';
+    var any = false;
     Object.keys(L).sort().forEach(function (k) {
       var e = L[k], x = e.hist[0];
       if (q && (k + ' ' + x.s).toLowerCase().indexOf(q) < 0) return;
-      h += '<details data-k="' + esc(k) + '"' + (OPEN[k] ? ' open' : '') + '><summary><span class="k">' + esc(k) +
-        '</span> <span class="m">' + x.t + ' · ' + e.n + ' msgs</span></summary>' +
-        '<div class="acts"><button data-copy="' + esc(k) + '">Copy JSON</button></div>' +
-        '<div class="m">' + esc(short(x.src || '', 100)) + '</div><pre>' + esc(x.s) + '</pre>';
-      if (e.hist.length > 1) {
-        var hk = k + ' #hist';
-        h += '<details data-k="' + esc(hk) + '"' + (OPEN[hk] ? ' open' : '') + '><summary class="m">Last ' + e.hist.length + ' values</summary>' +
-          e.hist.map(function (y) { return '<div class="hr"><span class="m">' + y.t + '</span> ' + esc(y.c) + '</div>'; }).join('') + '</details>';
+      any = true;
+      var open = isOpen(k, topicDefault);
+      h += '<details data-k="' + esc(k) + '"' + (open ? ' open' : '') + '><summary><span class="k">' + esc(k) +
+        '</span> <span class="m">' + x.t + ' · ' + e.n + ' msgs</span></summary>';
+      if (open) {
+        h += '<div class="acts"><button data-copy="' + esc(k) + '">Copy JSON</button></div>' +
+          '<div class="m">' + esc(short(x.src || '', 100)) + '</div>';
+        if (viewRaw || x.j === null || typeof x.j !== 'object') h += '<pre>' + esc(x.s) + '</pre>';
+        else {
+          var pv = e.hist[1] ? e.hist[1].j : undefined, hp = !!e.hist[1];
+          h += '<div class="tree">' + Object.keys(x.j).map(function (c) {
+            return tree(x.j[c], pv && typeof pv === 'object' ? pv[c] : undefined, hp, k, [c], c, 0);
+          }).join('') + '</div>';
+        }
+        if (e.hist.length > 1) {
+          var hk = k + ' #hist', ho = isOpen(hk, false);
+          h += '<details data-k="' + esc(hk) + '"' + (ho ? ' open' : '') + '><summary class="m">Last ' + e.hist.length + ' values</summary>' +
+            (ho ? e.hist.map(function (y) { return '<div class="hr"><span class="m">' + y.t + '</span> ' + esc(y.c) + '</div>'; }).join('') : '') + '</details>';
+        }
       }
       h += '</details>';
     });
-    return h || '<p class="m">Waiting for data. If the dashboard only sends changes, tap 🔄 Resend to make it send every current value again.</p>';
+    return any ? h : h + '<p class="m">Waiting for data. If the dashboard only sends changes, tap 🔄 Resend to make it send every current value again.</p>';
   }
 
   function renderPick() {
